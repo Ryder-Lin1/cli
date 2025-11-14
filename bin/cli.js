@@ -24,19 +24,29 @@ if (command === "install") {
 }
 
 const projectPath = path.join(process.cwd(), projectName);
+const starterPath = path.join(__dirname, "starter");
 
 fs.mkdirSync(projectPath, { recursive: true });
 
-fs.writeFileSync(
-  path.join(projectPath, "main.py"),
-  'def main():\n    print("Hello, World!")\n\nif __name__ == "__main__":\n    main()\n'
-);
+function copyRecursive(src, dest) {
+  const stats = fs.statSync(src);
 
-fs.writeFileSync(path.join(projectPath, "requirements.txt"), "");
+  if (stats.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    const entries = fs.readdirSync(src);
+    for (const entry of entries) {
+      const srcEntry = path.join(src, entry);
+      const destEntry = path.join(dest, entry);
+      copyRecursive(srcEntry, destEntry);
+    }
+  } else {
+    const destDir = path.dirname(dest);
+    fs.mkdirSync(destDir, { recursive: true });
+    const contents = fs.readFileSync(src);
+    fs.writeFileSync(dest, contents);
+  }
+}
 
-fs.writeFileSync(
-  path.join(projectPath, "README.md"),
-  `# ${projectName}\n\nA ChessHacks bot.\n`
-);
+copyRecursive(starterPath, projectPath);
 
 console.log(`✅ Created ${projectName}`);
