@@ -5,7 +5,6 @@
     "chesshacks": "./bin/cli.js"
   },
   "files": [
-    "bin",
-    "templates"
+    "bin"
   ]
 }
