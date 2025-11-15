@@ -1,0 +1,34 @@
+# Training folder - keep separate from main chess bot
+training/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Model weights (should be stored externally)
+*.pth
+*.pkl
+*.h5
+models/
+
+# Logs
+*.log
