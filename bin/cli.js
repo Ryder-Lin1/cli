@@ -4,6 +4,9 @@ const path = require("path");
 
 const rawArgs = process.argv.slice(2);
 
+const defaultGitignore =
+  "__pycache__\n.venv\nvenv\n.env.local\n.env\ndevtools\n";
+
 let command = "create";
 let projectName;
 
@@ -59,11 +62,7 @@ if (command === "install") {
   if (
     !gitignoreContents.split("\n").some((line) => line.trim() === "devtools")
   ) {
-    const newline =
-      gitignoreContents.endsWith("\n") || gitignoreContents.length === 0
-        ? ""
-        : "\n";
-    fs.writeFileSync(gitignorePath, gitignoreContents + newline + "devtools\n");
+    fs.writeFileSync(gitignorePath, defaultGitignore);
   }
 
   console.log(`\x1b[32m\x1b[1m\x1b[0m Installed devtools in ${installRoot}`);
@@ -78,11 +77,7 @@ if (command === "install") {
   if (
     !gitignoreContents.split("\n").some((line) => line.trim() === "devtools")
   ) {
-    const newline =
-      gitignoreContents.endsWith("\n") || gitignoreContents.length === 0
-        ? ""
-        : "\n";
-    fs.writeFileSync(gitignorePath, gitignoreContents + newline + "devtools\n");
+    fs.writeFileSync(gitignorePath, defaultGitignore);
   }
 
   console.log(`\x1b[32m\x1b[1m\x1b[0m Created ${projectName}`);
