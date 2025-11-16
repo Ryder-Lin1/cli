@@ -3,11 +3,20 @@ try:
 except ImportError:
     from utils import chess_manager, GameContext
 from chess import Move
+import chess
 import random
 import time
 import chess.pgn
 import os
-from huggingface_hub import hf_hub_download
+import sys
+import torch
+import math
+
+# Import NNUE module from same directory
+try:
+    from .nnue_local import NNUEModel, NNUEFeatures
+except ImportError:
+    from nnue_local import NNUEModel, NNUEFeatures
 
 # Piece values for tactical evaluation
 PIECE_VALUES = {
@@ -18,6 +27,268 @@ PIECE_VALUES = {
     chess.QUEEN: 900,
     chess.KING: 0
 }
+
+# NNUE-based evaluation (REQUIRED for competition)
+def evaluate_position_nnue(board):
+    """
+    Evaluate position using trained NNUE neural network
+    This is the PRIMARY evaluation method - neural network is CRITICAL
+    """
+    # Terminal position checks
+    if board.is_checkmate():
+        return -30000 if board.turn else 30000
+    
+    if board.is_stalemate() or board.is_insufficient_material():
+        return 0
+    
+    try:
+        # Extract NNUE features from board
+        white_features, black_features, buckets = NNUEFeatures.board_to_nnue_features(board)
+        print(f"[DEBUG] White features: {white_features}")
+        print(f"[DEBUG] Black features: {black_features}")
+        print(f"[DEBUG] Buckets: {buckets}")
+        if white_features is None:
+            # Fallback only if feature extraction fails
+            return 0
+        # Run neural network inference
+        with torch.no_grad():
+            stm = torch.tensor([1.0 if board.turn == chess.WHITE else -1.0], device=device)
+            evaluation = nnue_model(
+                [white_features], 
+                [black_features], 
+                [buckets[0]], 
+                [buckets[1]], 
+                stm
+            )
+            print(f"[DEBUG] Raw NNUE output: {evaluation}")
+            # Convert to centipawns
+            score = evaluation.item() * 100
+            print(f"[DEBUG] Centipawn score: {score}")
+            # Return from current player's perspective
+            return score if board.turn == chess.WHITE else -score
+            
+    except Exception as e:
+        print(f"⚠️ NNUE evaluation error: {e}")
+        # If neural network fails, bot cannot function (as per competition rules)
+        return 0
+
+def negamax(board, depth, alpha, beta):
+    """Negamax search with alpha-beta pruning using NNUE evaluation"""
+    if depth == 0 or board.is_game_over():
+        return evaluate_position_nnue(board)
+    
+    max_score = float('-inf')
+    for move in board.legal_moves:
+        board.push(move)
+        score = -negamax(board, depth - 1, -beta, -alpha)
+        board.pop()
+        
+        max_score = max(max_score, score)
+        alpha = max(alpha, score)
+        if alpha >= beta:
+            break
+    
+    return max_score
+
+# MCTS Node class for tree search
+class MCTSNode:
+    def __init__(self, board, parent=None, move=None):
+        self.board = board.copy()
+        self.parent = parent
+        self.move = move
+        self.children = []
+        self.visits = 0
+        self.value = 0.0
+        self.untried_moves = list(board.legal_moves)
+        
+    def is_fully_expanded(self):
+        return len(self.untried_moves) == 0
+    
+    def is_terminal(self):
+        return self.board.is_game_over()
+    
+    def best_child(self, c_param=1.4):
+        """Select best child using UCB1 formula"""
+        choices_weights = []
+        for child in self.children:
+            if child.visits == 0:
+                weight = float('inf')
+            else:
+                # UCB1 formula: exploitation + exploration
+                exploitation = child.value / child.visits
+                exploration = c_param * math.sqrt(math.log(self.visits) / child.visits)
+                weight = exploitation + exploration
+            choices_weights.append(weight)
+        
+        return self.children[choices_weights.index(max(choices_weights))]
+    
+    def expand(self):
+        """Expand a random untried move"""
+        move = self.untried_moves.pop()
+        new_board = self.board.copy()
+        new_board.push(move)
+        child_node = MCTSNode(new_board, parent=self, move=move)
+        self.children.append(child_node)
+        return child_node
+    
+    def backpropagate(self, result):
+        """Backpropagate the result up the tree"""
+        self.visits += 1
+        self.value += result
+        if self.parent:
+            # Flip result for parent (opponent's perspective)
+            self.parent.backpropagate(-result)
+
+def mcts_search(board, num_simulations=100, time_limit=2.0):
+    """
+    Monte Carlo Tree Search guided by NNUE neural network
+    Uses NNUE for position evaluation instead of random playouts
+    """
+    start_time = time.time()
+    root = MCTSNode(board)
+    
+    simulations_done = 0
+    
+    for i in range(num_simulations):
+        # Check time limit
+        if time.time() - start_time > time_limit:
+            print(f"⏱️ MCTS stopped after {simulations_done} simulations (time limit)")
+            break
+        
+        # Selection: traverse tree using UCB1
+        node = root
+        while not node.is_terminal() and node.is_fully_expanded():
+            node = node.best_child()
+        
+        # Expansion: add a new child node
+        if not node.is_terminal() and not node.is_fully_expanded():
+            node = node.expand()
+        
+        # Simulation: use NNUE to evaluate position (no random playout needed!)
+        if node.is_terminal():
+            # Terminal node evaluation
+            if node.board.is_checkmate():
+                result = -1.0  # Loss for player who just moved
+            else:
+                result = 0.0  # Draw
+        else:
+            # Use NNUE neural network to evaluate position
+            nnue_eval = evaluate_position_nnue(node.board)
+            # Normalize to [-1, 1] range
+            result = math.tanh(nnue_eval / 200.0)
+        
+        # Backpropagation: update statistics up the tree
+        node.backpropagate(result)
+        simulations_done += 1
+    
+    # Select best move based on visit counts (most robust)
+    if not root.children:
+        return None
+    
+    best_child = max(root.children, key=lambda c: c.visits)
+    
+    # Log MCTS statistics
+    print(f"🌲 MCTS completed {simulations_done} simulations in {time.time() - start_time:.2f}s")
+    print(f"   Best move: {board.san(best_child.move)} (visits: {best_child.visits}, value: {best_child.value/best_child.visits:.3f})")
+    
+    return best_child.move
+
+# Track move history to avoid repetition
+move_history = []
+position_history = {}
+
+def find_best_move_simple(board, depth=3):
+    """Minimax with alpha-beta pruning and repetition avoidance"""
+    global move_history, position_history
+    
+    best_move = None
+    alpha = float('-inf')
+    beta = float('inf')
+    
+    # Get all legal moves
+    legal_moves = list(board.legal_moves)
+    
+    # Track current position
+    current_fen = board.fen().split(' ')[0]  # Just piece positions
+    
+    # Prioritize captures, but only if they're good trades
+    prioritized_moves = []
+    development_moves = []
+    other_moves = []
+    repetitive_moves = []
+    
+    for move in legal_moves:
+        # Check if this move leads to repetition
+        board.push(move)
+        future_fen = board.fen().split(' ')[0]
+        board.pop()
+        
+        is_repetitive = position_history.get(future_fen, 0) >= 1
+        
+        captured_piece = board.piece_at(move.to_square)
+        moving_piece = board.piece_at(move.from_square)
+        
+        # Identify development moves
+        is_development = False
+        if moving_piece and moving_piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
+            from_rank = chess.square_rank(move.from_square)
+            # Knights/bishops moving from back rank
+            if (moving_piece.color == chess.WHITE and from_rank == 0) or (moving_piece.color == chess.BLACK and from_rank == 7):
+                is_development = True
+        
+        if is_repetitive:
+            repetitive_moves.append(move)
+        elif captured_piece and moving_piece:
+            # Only prioritize if we're capturing something of equal or greater value
+            if PIECE_VALUES[captured_piece.piece_type] >= PIECE_VALUES[moving_piece.piece_type]:
+                prioritized_moves.append(move)
+            else:
+                other_moves.append(move)
+        elif is_development:
+            development_moves.append(move)
+        else:
+            other_moves.append(move)
+    
+    # Search order: good captures -> development -> other moves -> repetitive moves (last resort)
+    ordered_moves = (prioritized_moves[:15] + development_moves[:15] + 
+                     other_moves[:20] + repetitive_moves)
+    
+    for move in ordered_moves:
+        board.push(move)
+        score = -negamax(board, depth - 1, -beta, -alpha)
+        board.pop()
+        
+        if score > alpha:
+            alpha = score
+            best_move = move
+    
+    # Update position history
+    if best_move:
+        board.push(best_move)
+        final_fen = board.fen().split(' ')[0]
+        position_history[final_fen] = position_history.get(final_fen, 0) + 1
+        board.pop()
+        
+        # Keep history manageable
+        if len(position_history) > 50:
+            # Remove oldest entries
+            oldest_keys = list(position_history.keys())[:10]
+            for key in oldest_keys:
+                del position_history[key]
+    
+    return best_move
+
+def get_opening_move(board):
+    """NO DATABASE MODE - Returns None to force engine calculation"""
+    # Competition rules forbid opening databases
+    # All moves must be calculated from scratch
+    return None
+
+def query_opening_database(board):
+    """NO DATABASE - Competition forbids databases"""
+    # Competition rules: no databases allowed
+    # All moves must use neural network evaluation
+    return None
 
 def get_piece_value(piece):
     """Get the value of a chess piece"""
@@ -113,99 +384,27 @@ def find_checks_and_threats(board):
 # Write code here that runs once
 # Can do things like load models from huggingface, make connections to subprocesses, etc.
 
-def load_opening_database(filename, description):
-    """Load a single opening database file"""
-    try:
-        opening_file = hf_hub_download(
-            repo_id="RyderL/chess_master_games",
-            filename=filename,
-            repo_type="dataset"
-        )
-        
-        games = []
-        with open(opening_file, 'r') as f:
-            while True:
-                game = chess.pgn.read_game(f)
-                if game is None:
-                    break
-                games.append(game)
-        
-        print(f"Loaded {filename} for {description}")
-        return games
-    except Exception as e:
-        print(f"Error loading {filename}: {e}")
-        return []
+# NO DATABASE LOADING - Competition rules forbid databases
+# All evaluation must use trained neural network
 
-# Load opening databases (automatically fetch all available files)
-print("Loading opening databases...")
+# Load trained NNUE model (REQUIRED for competition)
+print("🧠 Loading trained NNUE model...")
+nnue_model = NNUEModel()
+device = torch.device('cpu')  # Use CPU for fast inference
+nnue_model.to(device)
 
-# Dynamically get all available files from Hugging Face
-black_openings = []
+# Load trained weights
+weights_path = os.path.join(os.path.dirname(__file__), "weights", "nnue_model.pt")
+if os.path.exists(weights_path):
+    nnue_model.load_state_dict(torch.load(weights_path, map_location=device))
+    nnue_model.eval()
+    print(f"✅ NNUE model loaded from {weights_path}")
+else:
+    print(f"⚠️ Warning: NNUE weights not found at {weights_path}")
+    print("   Please train the model first using train_nnue_local.py")
 
-try:
-    from huggingface_hub import list_repo_files
-    all_files = list_repo_files('RyderL/chess_master_games', repo_type='dataset')
-    
-    # Filter to get only the database files (exclude README.md and .gitattributes)
-    database_files = [f for f in all_files if not f.endswith('.md') and not f.endswith('.gitattributes') and '.' not in f]
-    
-    print(f"Found {len(database_files)} database files: {', '.join(database_files)}")
-    
-    # Load all available database files
-    for filename in database_files:
-        print(f"Loading {filename}...")
-        games = load_opening_database(filename, "Black")
-        black_openings.extend(games)
-        print(f"  ✅ Loaded {len(games)} games from {filename}")
-        
-except Exception as e:
-    print(f"❌ Error fetching file list: {e}")
-    print("Falling back to known good files...")
-    # Fallback to known files if the dynamic fetch fails
-    fallback_files = ["kid1", "kid2", "opening", "sideline"]
-    for filename in fallback_files:
-        try:
-            print(f"Loading {filename}...")
-            games = load_opening_database(filename, "Black")
-            black_openings.extend(games)
-            print(f"  ✅ Loaded {len(games)} games from {filename}")
-        except Exception as file_error:
-            print(f"  ⚠️ Failed to load {filename}: {file_error}")
-
-print(f"Total opening games loaded: {len(black_openings)} (White: 0, Black: {len(black_openings)})")
-
-# Check first 100 games for e4 openings
-print("\n🔍 Checking first 100 games for e4 openings...")
-e4_games = []
-games_to_check = min(100, len(black_openings))
-
-for i, game in enumerate(black_openings[:games_to_check]):
-    try:
-        # Get the first move of the game
-        moves = list(game.mainline_moves())
-        if moves:
-            first_move = moves[0]
-            # Check if first move is e4 (pawn to e4)
-            if str(first_move) == 'e4':
-                e4_games.append({
-                    'game': game,
-                    'index': i,
-                    'white_player': game.headers.get('White', 'Unknown'),
-                    'black_player': game.headers.get('Black', 'Unknown'),
-                    'moves': ' '.join(str(move) for move in moves[:10])  # First 10 moves
-                })
-    except Exception as e:
-        print(f"Error checking game {i}: {e}")
-
-print(f"📊 Found {len(e4_games)} games starting with e4 out of {games_to_check} checked:")
-for i, game_info in enumerate(e4_games[:10]):  # Show first 10 e4 games
-    print(f"  {i+1}. {game_info['white_player']} vs {game_info['black_player']}")
-    print(f"     Moves: {game_info['moves']}")
-
-if len(e4_games) > 10:
-    print(f"     ... and {len(e4_games) - 10} more e4 games")
-
-print("♟️  Chess bot initialized with opening databases + tactical analysis")
+print("♟️ Chess bot initialized - NNUE Neural Network Mode")
+print("   Using NNUE evaluation with minimax search")
 
 
 
@@ -311,290 +510,128 @@ def minimax_search(board, depth=3):
 
 @chess_manager.entrypoint
 def test_func(ctx: GameContext):
-    # This gets called every time the model needs to make a move
-    # Return a python-chess Move object that is a legal move for the current position
-
-    print("🎯 Making move for", "WHITE" if ctx.board.turn == chess.WHITE else "BLACK")
-    print("📝 Current move stack:", [str(m) for m in ctx.board.move_stack])
-    print("⏰ Move number:", len(ctx.board.move_stack) + 1)
-
-    # Try to find a move from opening database first  
-    if black_openings and len(ctx.board.move_stack) < 15:  # Use opening book for first 15 moves
-        print("🔍 Searching opening database...")
-        
-        # Only use Black openings for now (White openings will be added later)
-        if ctx.board.turn == chess.BLACK:
-            current_openings = black_openings
-            print(f"📖 Using Black opening database ({len(black_openings)} games)")
-        else:
-            print("⚪ White to move - no White openings loaded yet, using tactical fallback")
-            current_openings = []
-        
-        candidate_moves = {}  # Track move frequencies: {move_str: {'move': move_obj, 'count': int, 'sources': []}}
-        
-        if current_openings:  # Only search if we have openings available
-            games_checked = 0
-            
-            for game in current_openings:
-                games_checked += 1
-                    
-                if games_checked % 200 == 0:
-                    print(f"🔄 Checked {games_checked} games so far...")
-                game_board = game.board()
-                moves_match = True
-                
-                # Check if current game matches this opening
-                for i, move in enumerate(game.mainline_moves()):
-                    if i >= len(ctx.board.move_stack):
-                        # Found a continuation move!
-                        if move in ctx.board.legal_moves:
-                            move_str = str(move)
-                            if move_str not in candidate_moves:
-                                candidate_moves[move_str] = {
-                                    'move': move,
-                                    'count': 0,
-                                    'sources': []
-                                }
-                            candidate_moves[move_str]['count'] += 1
-                            candidate_moves[move_str]['sources'].append({
-                                'game': game.headers.get('White', 'Unknown'),
-                                'source': game.headers.get('Event', 'Unknown')
-                            })
-                        break
-                    elif i < len(ctx.board.move_stack):
-                        if move != ctx.board.move_stack[i]:
-                            moves_match = False
-                            # If Black played differently, stop looking through this game immediately
-                            break
-                        game_board.push(move)
-                
-                if not moves_match:
-                    continue
-        
-        # If we found candidate moves, filter by frequency and choose one
-        if candidate_moves:
-            # Filter moves that appear at least 2 times
-            frequent_moves = {move_str: data for move_str, data in candidate_moves.items() if data['count'] >= 2}
-            
-            if frequent_moves:
-                # Prefer moves that appear 3+ times, otherwise use 2+ times
-                very_frequent = {move_str: data for move_str, data in frequent_moves.items() if data['count'] >= 3}
-                
-                if very_frequent:
-                    chosen_moves = very_frequent
-                    print(f"✨ Using high-frequency moves (3+ occurrences)")
-                else:
-                    chosen_moves = frequent_moves
-                    print(f"📈 Using medium-frequency moves (2+ occurrences)")
-                
-                # Randomly select from filtered moves
-                move_str = random.choice(list(chosen_moves.keys()))
-                chosen_data = chosen_moves[move_str]
-                move = chosen_data['move']
-                count = chosen_data['count']
-                
-                # Show some source info
-                sources = chosen_data['sources'][:3]  # Show first 3 sources
-                source_names = [s['game'] for s in sources]
-                
-                print(f"🎯 Selected opening move: {ctx.board.san(move)} (appears {count} times)")
-                print(f"📚 Sources: {', '.join(source_names)}")
-                print(f"📊 Total moves found: {len(candidate_moves)}, frequent moves: {len(frequent_moves)}")
-                ctx.logProbabilities({move: 1.0})
-                
-                # Analyze the opening move quality
-                analyze_move_quality(ctx, move)
-                
-                return move
-            else:
-                print(f"⚠️ No moves appear frequently enough (need 2+ occurrences)")
-                print(f"📊 Found {len(candidate_moves)} total moves but all appear only once")
-
-    print("No opening move found, using tactical analysis...")
-    
-    # Fallback to tactical analysis
-    legal_moves = list(ctx.board.generate_legal_moves())
-    if not legal_moves:
-        ctx.logProbabilities({})
-        raise ValueError("No legal moves available (i probably lost didn't i)")
-
-    # Check for tactical opportunities before random moves
-    print("Checking for tactical opportunities...")
-    
-    if tactical_move := find_best_capture(ctx.board):
-        print("⚔️ Tactical capture found!")
-        ctx.logProbabilities({tactical_move: 1.0})
-        
-        # Analyze the tactical move quality
-        analyze_move_quality(ctx, tactical_move)
-        
-        return tactical_move
-    
-    if threat_move := find_checks_and_threats(ctx.board):
-        print("🚨 Emergency check found!")
-        ctx.logProbabilities({threat_move: 1.0})
-        
-        # Analyze the threat move quality
-        analyze_move_quality(ctx, threat_move)
-        
-        return threat_move
-    
-    # Try Local NNUE evaluation
+    """
+    Chess bot move selection - MCTS + NNUE NEURAL NETWORK MODE
+    Neural network is CRITICAL - guides MCTS tree search and evaluates all positions
+    """
     try:
-        from nnue_local import evaluate_with_nnue
+        # Wait 2 seconds after opponent's move to analyze position
+        print("⏳ Analyzing opponent's move for 2 seconds...")
+        time.sleep(2)
         
-        print("🧠 Using Local NNUE evaluation...")
+        board = ctx.board.copy()
         
-        # Evaluate all legal moves with NNUE
-        legal_moves = list(ctx.board.legal_moves)
-        if legal_moves and len(legal_moves) <= 30:  # Use NNUE for reasonable move counts
-            print(f"🧠 Evaluating {len(legal_moves)} moves with Local NNUE...")
-            
-            move_evaluations = []
+        print(f"🧠 NNUE-guided MCTS for position: {board.fen()}")
+        
+        # Check game phase to determine search strategy
+        move_number = board.fullmove_number
+        num_pieces = len(board.piece_map())
+        
+        # Use MCTS for middle game and complex positions (most effective)
+        if 10 <= num_pieces <= 25 and move_number > 5:
+            print("🌲 Using MCTS with NNUE evaluation...")
+            try:
+                # Adjust simulations based on position complexity
+                num_sims = 150 if num_pieces > 15 else 100
+                best_move = mcts_search(board, num_simulations=num_sims, time_limit=2.0)
+                
+                if best_move:
+                    board.push(best_move)
+                    eval_score = evaluate_position_nnue(board)
+                    board.pop()
+                    
+                    print(f"🎯 MCTS+NNUE move: {ctx.board.san(best_move)} (eval: {eval_score:.0f})")
+                    ctx.logProbabilities({best_move: 1.0})
+                    return best_move
+            except Exception as e:
+                print(f"⚠️ MCTS failed, falling back to minimax: {e}")
+        
+        # Use minimax for opening, endgame, or as fallback
+        print("♟️ Using NNUE-guided minimax...")
+        try:
+            # Quick search depth (takes about 2 seconds)
+            best_move = find_best_move_simple(board, depth=2)
+            if best_move:
+                # Get NNUE evaluation of the resulting position
+                board.push(best_move)
+                eval_score = evaluate_position_nnue(board)
+                board.pop()
+                
+                print(f"🎯 NNUE minimax move: {ctx.board.san(best_move)} (eval: {eval_score:.0f})")
+                ctx.logProbabilities({best_move: 1.0})
+                return best_move
+        except Exception as e:
+            print(f"⚠️ Minimax failed: {e}")
+        
+        # Fallback: evaluate all legal moves with NNUE
+        print("🔄 Using direct NNUE evaluation fallback...")
+        legal_moves = list(board.legal_moves)
+        if legal_moves:
+            best_move = None
+            best_eval = float('-inf')
             
             for move in legal_moves:
-                # Make move temporarily
-                ctx.board.push(move)
+                board.push(move)
+                eval_score = evaluate_position_nnue(board)
+                board.pop()
                 
-                # Evaluate position with local NNUE
-                evaluation = evaluate_with_nnue(ctx.board)
-                
-                # Undo move
-                ctx.board.pop()
-                
-                move_evaluations.append((move, evaluation))
+                if eval_score > best_eval:
+                    best_eval = eval_score
+                    best_move = move
             
-            # Sort by evaluation (best for current player)
-            move_evaluations.sort(key=lambda x: x[1], reverse=True)
-            
-            # Select best move
-            best_move, best_eval = move_evaluations[0]
-            
-            print(f"✅ Local NNUE selected: {ctx.board.san(best_move)} (eval: {best_eval:.2f})")
-            print(f"📊 Top 3 moves:")
-            for i, (move, eval_score) in enumerate(move_evaluations[:3]):
-                print(f"  {i+1}. {ctx.board.san(move)}: {eval_score:.2f}")
-            
-            ctx.logProbabilities({best_move: 1.0})
-            analyze_move_quality(ctx, best_move)
-            return best_move
-        else:
-            if legal_moves:
-                print(f"⚠️ Too many moves ({len(legal_moves)}) for NNUE evaluation - using fallback")
-            else:
-                print("⚠️ No legal moves to evaluate")
-            
-    except ImportError:
-        print("⚠️ Local NNUE not available (PyTorch not installed)")
-    except Exception as e:
-        print(f"⚠️ Local NNUE error: {e}")
-
-    # Try Modal minimax service if neural network fails
-    try:
-        # Import the minimax client (optional dependency)
-        from minimax_client import get_minimax_client
+            if best_move:
+                print(f"� NNUE fallback move: {ctx.board.san(best_move)} (eval: {best_eval:.0f})")
+                ctx.logProbabilities({best_move: 1.0})
+                return best_move
         
-        print("🧠 Trying Modal minimax service...")
-        client = get_minimax_client()
+        print("❌ No legal moves found!")
+        return None
         
-        if client.is_available():
-            minimax_move = client.get_best_move(ctx.board, depth=4)
-            if minimax_move and minimax_move in ctx.board.legal_moves:
-                print(f"🎯 Minimax found move: {ctx.board.san(minimax_move)}")
-                ctx.logProbabilities({minimax_move: 1.0})
-                
-                # Analyze the minimax move quality (should be good!)
-                analyze_move_quality(ctx, minimax_move)
-                
-                return minimax_move
-            else:
-                print("⚠️ Minimax returned invalid move")
-        else:
-            print("⚠️ Minimax service not available")
-            
-    except ImportError:
-        print("⚠️ Minimax client not installed (optional)")
     except Exception as e:
-        print(f"⚠️ Minimax service error: {e}")
-    
-    print("No AI services available, proceeding with random selection...")
-    
-    move_weights = [random.random() for _ in legal_moves]
-    total_weight = sum(move_weights)
-    # Normalize so probabilities sum to 1
-    move_probs = {
-        move: weight / total_weight
-        for move, weight in zip(legal_moves, move_weights)
-    }
-    ctx.logProbabilities(move_probs)
+        print(f"❌ Critical error: {e}")
+        print("❌ Cannot function without neural network")
+        return None
 
-    selected_move = random.choices(legal_moves, weights=move_weights, k=1)[0]
-    
-    # Analyze the position after making the move
-    analyze_move_quality(ctx, selected_move)
-    
-    return selected_move
 
 def analyze_move_quality(ctx: GameContext, move):
     """
-    Analyze the quality of a move using minimax evaluation
+    Analyze the quality of a move using local evaluation
     """
     try:
-        # Import the minimax client (optional dependency)
-        import sys
-        import os
-        sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'training'))
-        from minimax_client import get_minimax_client
-        
         # Get evaluation before the move
-        eval_before = 0
-        try:
-            client = get_minimax_client()
-            if client.is_available():
-                eval_before = client.evaluate_position(ctx.board)
-        except:
-            pass
+        eval_before = evaluate_board(ctx.board)
         
         # Make the move temporarily to evaluate the resulting position
         ctx.board.push(move)
         
-        # Get evaluation after the move
-        eval_after = 0
-        try:
-            client = get_minimax_client()
-            if client.is_available():
-                eval_after = client.evaluate_position(ctx.board)
-                
-                # Calculate move quality
-                last_move = ctx.board.peek()  # Get the last move played
-                eval_change = eval_after - eval_before
-                
-                # Interpret the evaluation change
-                if abs(eval_change) < 20:
-                    quality = "⚪ Neutral"
-                elif eval_change > 50:
-                    quality = "🟢 Good"  
-                elif eval_change > 100:
-                    quality = "🔥 Excellent"
-                elif eval_change < -50:
-                    quality = "🔴 Poor"
-                elif eval_change < -100:
-                    quality = "💀 Blunder"
-                else:
-                    quality = "🟡 Okay"
-                
-                print(f"📊 Move Analysis: {str(last_move)} {quality}")
-                print(f"   Eval change: {eval_change:+.0f} centipawns")
-                print(f"   Position eval: {eval_after:.0f}")
-                
-        except Exception as e:
-            print(f"⚠️ Move analysis failed: {e}")
+        # Get evaluation after the move  
+        eval_after = evaluate_board(ctx.board)
+        
+        # Calculate move quality
+        last_move = ctx.board.peek()  # Get the last move played
+        eval_change = eval_after - eval_before
+        
+        # Interpret the evaluation change
+        if abs(eval_change) < 50:
+            quality = "⚪ Neutral"
+        elif eval_change > 100:
+            quality = "🟢 Good"  
+        elif eval_change > 200:
+            quality = "🔥 Excellent"
+        elif eval_change < -100:
+            quality = "🔴 Poor"
+        elif eval_change < -200:
+            quality = "💀 Blunder"
+        else:
+            quality = "🟡 Okay"
+        
+        print(f"📊 Move Analysis: {str(last_move)} {quality}")
+        print(f"   Eval change: {eval_change:+.0f} points")
+        print(f"   Position eval: {eval_after:.0f}")
         
         # Undo the temporary move
         ctx.board.pop()
         
-    except ImportError:
-        pass  # Minimax client not available, skip analysis
     except Exception as e:
         print(f"⚠️ Move analysis error: {e}")
 

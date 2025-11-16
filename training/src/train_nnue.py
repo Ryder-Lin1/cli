@@ -39,79 +39,110 @@ class ChessGameDataset(Dataset):
         print(f"📚 Loading positions from {pgn_path}...")
         
         position_count = 0
+        game_count = 0
+        error_count = 0
         
         try:
             with open(pgn_path, 'r') as f:
                 while position_count < self.max_positions:
-                    game = chess.pgn.read_game(f)
-                    if game is None:
-                        break
-                    
-                    # Extract positions from game
-                    self._extract_positions_from_game(game, position_count)
-                    position_count = len(self.positions)
-                    
-                    if position_count % 1000 == 0:
-                        print(f"  📊 Loaded {position_count} positions...")
+                    try:
+                        game = chess.pgn.read_game(f)
+                        if game is None:
+                            break
+                        
+                        game_count += 1
+                        
+                        # Extract positions from game
+                        self._extract_positions_from_game(game, position_count)
+                        position_count = len(self.positions)
+                        
+                        if position_count % 5000 == 0:
+                            print(f"  📊 Loaded {position_count} positions from {game_count} games...")
+                        
+                        # Stop if we've processed enough games or hit errors
+                        if error_count > 100:
+                            print(f"⚠️ Too many parsing errors ({error_count}), stopping...")
+                            break
+                            
+                    except Exception as game_error:
+                        error_count += 1
+                        if error_count % 10 == 0:
+                            print(f"⚠️ Skipped {error_count} problematic games...")
+                        continue
         
         except Exception as e:
             print(f"❌ Error loading PGN: {e}")
-            self._create_dummy_data()
+            if len(self.positions) < 1000:
+                self._create_dummy_data()
         
-        print(f"✅ Loaded {len(self.positions)} total positions")
+        print(f"✅ Loaded {len(self.positions)} positions from {game_count} games (skipped {error_count} errors)")
     
     def _extract_positions_from_game(self, game, current_count):
         """Extract training positions from a single game"""
         if current_count >= self.max_positions:
             return
         
-        board = game.board()
-        moves = list(game.mainline_moves())
-        
-        # Skip very short games
-        if len(moves) < 10:
-            return
-        
-        # Get game result for evaluation targets
-        result = game.headers.get('Result', '*')
-        if result == '1-0':
-            white_target, black_target = 1.0, -1.0
-        elif result == '0-1':
-            white_target, black_target = -1.0, 1.0
-        else:
-            white_target, black_target = 0.0, 0.0
-        
-        # Extract positions from middle game (skip opening and endgame)
-        start_move = min(8, len(moves) // 4)
-        end_move = max(len(moves) - 8, len(moves) * 3 // 4)
-        
-        for i, move in enumerate(moves):
-            if current_count + len(self.positions) >= self.max_positions:
-                break
+        try:
+            board = game.board()
+            moves = list(game.mainline_moves())
             
-            if start_move <= i < end_move:
-                # Extract features
-                white_feat, black_feat, stm = self.feature_extractor.extract_features(board)
+            # Skip very short games
+            if len(moves) < 10:
+                return
+            
+            # Get game result for evaluation targets
+            result = game.headers.get('Result', '*')
+            if result == '1-0':
+                white_target, black_target = 1.0, -1.0
+            elif result == '0-1':
+                white_target, black_target = -1.0, 1.0
+            else:
+                white_target, black_target = 0.0, 0.0
+            
+            # Extract positions from middle game (skip opening and endgame)
+            start_move = min(8, len(moves) // 4)
+            end_move = max(len(moves) - 8, len(moves) * 3 // 4)
+            
+            for i, move in enumerate(moves):
+                if current_count + len(self.positions) >= self.max_positions:
+                    break
                 
-                if white_feat is not None:
-                    # Target based on game outcome and side to move
-                    if stm.item() > 0:  # White to move
-                        target = white_target
-                    else:  # Black to move
-                        target = black_target
+                if start_move <= i < end_move:
+                    try:
+                        # Extract features before making the move
+                        white_feat, black_feat, stm = self.feature_extractor.extract_features(board)
+                        
+                        if white_feat is not None:
+                            # Target based on game outcome and side to move
+                            if stm.item() > 0:  # White to move
+                                target = white_target
+                            else:  # Black to move
+                                target = black_target
+                            
+                            # Add some noise to targets
+                            target += random.uniform(-0.2, 0.2)
+                            target = np.clip(target, -2.0, 2.0)
+                            
+                            self.positions.append({
+                                'white_features': white_feat,
+                                'black_features': black_feat,
+                                'side_to_move': stm,
+                                'target': torch.tensor([target], dtype=torch.float32)
+                            })
+                    except Exception as move_error:
+                        # Skip this position if feature extraction fails
+                        pass
+                
+                try:
+                    # Try to make the move, skip if it fails (promotions, illegal moves, etc.)
+                    board.push(move)
+                except Exception as push_error:
+                    # Skip this game if we can't make a move
+                    break
                     
-                    # Add some noise to targets
-                    target += random.uniform(-0.2, 0.2)
-                    target = np.clip(target, -2.0, 2.0)
-                    
-                    self.positions.append({
-                        'white_features': white_feat,
-                        'black_features': black_feat,
-                        'side_to_move': stm,
-                        'target': torch.tensor([target], dtype=torch.float32)
-                    })
-            
-            board.push(move)
+        except Exception as game_error:
+            # Skip entire game if there are issues
+            pass
     
     def _create_dummy_data(self):
         """Create dummy training data for testing"""
@@ -193,8 +224,7 @@ class NNUETrainer:
             self.optimizer,
             mode='min',
             factor=0.5,
-            patience=5,
-            verbose=True
+            patience=5
         )
     
     def train_epoch(self, dataloader):
@@ -349,10 +379,10 @@ def train_nnue_model():
     print("=" * 50)
     
     # Configuration
-    PGN_PATH = "../data/games.pgn"  # Put your PGN file here
-    MAX_POSITIONS = 50000
+    PGN_PATH = "data/training_games.pgn"  # Your 1GB PGN file (fixed path)
+    MAX_POSITIONS = 50000  # Reasonable amount for faster training
     EPOCHS = 15
-    BATCH_SIZE = 128
+    BATCH_SIZE = 64
     
     # Create dataset
     print("📚 Loading training data...")

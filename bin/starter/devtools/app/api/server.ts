@@ -14,7 +14,7 @@ let restarting = false;
 let lastRestartAt: number | null = null;
 let lastRestartReason: "manual" | "file-change" | null = null;
 
-const servePort = Number(process.env.SERVE_PORT || "5058");
+const servePort = Number(process.env.SERVE_PORT || "5059");
 
 console.log("[devtools env]", {
   PYTHON_EXECUTABLE: process.env.PYTHON_EXECUTABLE,

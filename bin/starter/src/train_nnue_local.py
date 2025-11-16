@@ -19,13 +19,14 @@ from nnue_local import NNUEModel, NNUEFeatures
 class ChessPositionDataset(Dataset):
     """Dataset of chess positions from PGN games"""
     
-    def __init__(self, pgn_file, max_positions=50000):
+    def __init__(self, pgn_file, max_positions=50000, skip_positions=0):
         self.positions = []
         self.max_positions = max_positions
+        self.skip_positions = skip_positions
         self._load_positions(pgn_file)
     
     def _load_positions(self, pgn_file):
-        """Load chess positions from compressed PGN file"""
+        """Load chess positions from PGN file"""
         print(f"📚 Loading positions from {pgn_file}...")
         
         if not os.path.exists(pgn_file):
@@ -36,72 +37,95 @@ class ChessPositionDataset(Dataset):
         game_count = 0
         
         try:
-            with open(pgn_file, 'rb') as f:
-                dctx = zstd.ZstdDecompressor()
-                with dctx.stream_reader(f) as reader:
-                    text_stream = io.TextIOWrapper(reader, encoding='utf-8')
-                    
-                    while position_count < self.max_positions:
-                        game = chess.pgn.read_game(text_stream)
-                        if game is None:
-                            break
-                        
-                        game_count += 1
-                        if game_count % 100 == 0:
-                            print(f"  📖 Processed {game_count} games, {position_count} positions...")
-                        
-                        # Extract positions from game
-                        board = game.board()
-                        moves = list(game.mainline_moves())
-                        
-                        # Skip very short games
-                        if len(moves) < 10:
-                            continue
-                        
-                        # Extract positions from different parts of the game
-                        for i, move in enumerate(moves):
-                            if position_count >= self.max_positions:
-                                break
-                            
-                            # Skip opening moves (first 6) and endgame (last 10)
-                            if i < 6 or i >= len(moves) - 10:
-                                board.push(move)
-                                continue
-                            
-                            # Extract features
-                            white_features, black_features, buckets = NNUEFeatures.board_to_nnue_features(board)
-                            
-                            if white_features is not None:
-                                # Simple evaluation based on game outcome
-                                result = game.headers.get('Result', '*')
-                                
-                                if result == '1-0':  # White wins
-                                    target = 1.0 if board.turn else -1.0
-                                elif result == '0-1':  # Black wins
-                                    target = -1.0 if board.turn else 1.0
-                                else:  # Draw or unknown
-                                    target = 0.0
-                                
-                                # Add some positional noise
-                                target += random.uniform(-0.2, 0.2)
-                                
-                                self.positions.append({
-                                    'white_features': white_features,
-                                    'black_features': black_features,
-                                    'white_bucket': buckets[0],
-                                    'black_bucket': buckets[1],
-                                    'stm': 1.0 if board.turn else -1.0,
-                                    'target': target
-                                })
-                                
-                                position_count += 1
-                            
-                            board.push(move)
+            # Check if file is compressed or not
+            is_compressed = pgn_file.endswith('.zst')
+            
+            if is_compressed:
+                with open(pgn_file, 'rb') as f:
+                    dctx = zstd.ZstdDecompressor()
+                    with dctx.stream_reader(f) as reader:
+                        text_stream = io.TextIOWrapper(reader, encoding='utf-8')
+                        position_count, game_count = self._process_pgn_stream(text_stream, position_count, game_count)
+            else:
+                # Regular uncompressed PGN file
+                with open(pgn_file, 'r', encoding='utf-8', errors='ignore') as text_stream:
+                    position_count, game_count = self._process_pgn_stream(text_stream, position_count, game_count)
         
         except Exception as e:
             print(f"❌ Error loading positions: {e}")
         
         print(f"✅ Loaded {len(self.positions)} positions from {game_count} games")
+    
+    def _process_pgn_stream(self, text_stream, position_count, game_count):
+        """Process games from a text stream"""
+        total_positions_seen = 0  # Track all positions to handle skipping
+        
+        while position_count < self.max_positions:
+            game = chess.pgn.read_game(text_stream)
+            if game is None:
+                break
+            
+            game_count += 1
+            if game_count % 100 == 0:
+                print(f"  📖 Processed {game_count} games, {total_positions_seen} total positions ({position_count} loaded)...")
+            
+            # Extract positions from game
+            board = game.board()
+            moves = list(game.mainline_moves())
+            
+            # Skip very short games
+            if len(moves) < 10:
+                continue
+            
+            # Extract positions from different parts of the game
+            for i, move in enumerate(moves):
+                # Skip opening moves (first 6) and endgame (last 10)
+                if i < 6 or i >= len(moves) - 10:
+                    board.push(move)
+                    continue
+                
+                # Extract features
+                white_features, black_features, buckets = NNUEFeatures.board_to_nnue_features(board)
+                
+                if white_features is not None:
+                    # Check if we should skip this position
+                    if total_positions_seen < self.skip_positions:
+                        total_positions_seen += 1
+                        board.push(move)
+                        continue
+                    
+                    # Check if we've collected enough positions
+                    if position_count >= self.max_positions:
+                        break
+                    
+                    # Simple evaluation based on game outcome
+                    result = game.headers.get('Result', '*')
+                    
+                    if result == '1-0':  # White wins
+                        target = 1.0 if board.turn else -1.0
+                    elif result == '0-1':  # Black wins
+                        target = -1.0 if board.turn else 1.0
+                    else:  # Draw or unknown
+                        target = 0.0
+                    
+                    # Add some positional noise
+                    target += random.uniform(-0.2, 0.2)
+                    
+                    self.positions.append({
+                        'white_features': white_features,
+                        'black_features': black_features,
+                        'white_bucket': buckets[0],
+                        'black_bucket': buckets[1],
+                        'stm': 1.0 if board.turn else -1.0,
+                        'target': target
+                    })
+                    
+                    position_count += 1
+                    total_positions_seen += 1
+                
+                board.push(move)
+        
+        return position_count, game_count
     
     def __len__(self):
         return len(self.positions)
@@ -133,7 +157,7 @@ def train_local_nnue():
     
     # Find the database file
     data_dir = "/Users/jennylin/Documents/GitHub/cli/training/data"
-    pgn_file = os.path.join(data_dir, "lichess_db_standard_rated_2013-07.pgn.zst")
+    pgn_file = os.path.join(data_dir, "AJ-CORR-PGN-000.pgn")
     
     if not os.path.exists(pgn_file):
         print(f"❌ Database file not found: {pgn_file}")
@@ -142,7 +166,8 @@ def train_local_nnue():
     
     # Create dataset
     print("🎯 Creating training dataset...")
-    dataset = ChessPositionDataset(pgn_file, max_positions=20000)  # Start with smaller dataset
+    print("� Loading 500,000 positions from master games (near-professional training)...")
+    dataset = ChessPositionDataset(pgn_file, max_positions=500000, skip_positions=0)  # Train on 500K positions
     
     if len(dataset) == 0:
         print("❌ No positions loaded - cannot train")
@@ -169,7 +194,7 @@ def train_local_nnue():
     criterion = nn.MSELoss()
     
     # Training loop
-    num_epochs = 10
+    num_epochs = 15
     print(f"🚀 Training for {num_epochs} epochs...")
     
     model.train()
